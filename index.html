@@ -1,0 +1,1106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Finger Filters</title>
+<style>
+  :root {
+    --bg: #0b0b10;
+    --panel: rgba(20, 20, 28, 0.72);
+    --text: #f4f4f8;
+    --muted: #a3a3b5;
+    --accent: #ffd23f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, -apple-system, sans-serif; overflow: hidden; }
+  #out { position: fixed; inset: 0; width: 100vw; height: 100vh; object-fit: cover; display: block; }
+  video { display: none; }
+
+  #hint { position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    padding: 8px 16px; border-radius: 999px; font-size: 14px; color: var(--muted);
+    white-space: nowrap; transition: opacity .3s; }
+
+  #bar { position: fixed; left: 0; right: 0; bottom: 20px; display: flex; gap: 10px;
+    justify-content: center; padding: 0 16px; overflow-x: auto; scrollbar-width: none; }
+  #bar::-webkit-scrollbar { display: none; }
+  .chip { flex: none; border: 2px solid transparent; background: var(--panel);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    color: var(--text); font: inherit; font-size: 15px; font-weight: 600;
+    padding: 10px 16px; border-radius: 999px; cursor: pointer; transition: transform .15s, border-color .15s; }
+  .chip:hover { transform: translateY(-2px); }
+  .chip.active { border-color: var(--accent); color: var(--accent); }
+  .chip .emoji { margin-right: 6px; }
+
+  #snap { position: fixed; right: 20px; top: 16px; width: 48px; height: 48px; border-radius: 50%;
+    border: 3px solid #fff; background: rgba(255,255,255,.18); cursor: pointer; font-size: 20px; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity .25s; }
+
+  #start { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); z-index: 10; }
+  #start .card { text-align: center; max-width: 420px; padding: 0 16px; }
+  #start h1 { font-size: 40px; margin: 0 0 8px; }
+  #start p { color: var(--muted); line-height: 1.5; margin: 0 0 24px; }
+  #start button { font: inherit; font-size: 18px; font-weight: 700; padding: 14px 28px; border-radius: 999px;
+    border: none; background: var(--accent); color: #111; cursor: pointer; }
+  #start button:disabled { opacity: .6; cursor: wait; }
+  #err { color: #ff7a7a; margin-top: 16px; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video>
+<canvas id="out"></canvas>
+<div id="hint">Loading…</div>
+<button id="snap" title="Take a photo (Space)">📸</button>
+<div id="bar"></div>
+<div id="flash"></div>
+
+<div id="start">
+  <div class="card">
+    <h1>✌️ Finger Filters</h1>
+    <p>Hold up your hand and spread your <b>thumb</b> and <b>pointer finger</b>. The filter fills the shape drawn from fingertip to fingertip.
+       Use two hands to connect all four fingers, and flip one hand upside down to cross the lines into two triangles. Switch filters with the buttons or the ← → keys. In Anime mode, press H to change hair color and E for eye color.</p>
+    <button id="go">Start camera</button>
+    <div id="err"></div>
+  </div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.webgpu.bundle.min.mjs";
+import Anime4K from "https://cdn.jsdelivr.net/npm/anime4k-webgpu@1.0.0/+esm";
+
+// ---------- helpers ----------
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+function luminance(d, n) {
+  const L = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) L[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+  return L;
+}
+function blur3(L, w, h) {
+  const o = new Float32Array(L.length);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, c = 0;
+    for (let dy = -1; dy <= 1; dy++) { const yy = y + dy; if (yy < 0 || yy >= h) continue;
+      for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= w) continue; s += L[yy * w + xx]; c++; } }
+    o[y * w + x] = s / c;
+  }
+  return o;
+}
+function sobel(L, w, h) {
+  const m = new Float32Array(L.length);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x;
+    const gx = -L[i - w - 1] - 2 * L[i - 1] - L[i + w - 1] + L[i - w + 1] + 2 * L[i + 1] + L[i + w + 1];
+    const gy = -L[i - w - 1] - 2 * L[i - w] - L[i - w + 1] + L[i + w - 1] + 2 * L[i + w] + L[i + w + 1];
+    m[i] = Math.sqrt(gx * gx + gy * gy);
+  }
+  return m;
+}
+function gradientLUT(stops) {
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (stops.length - 1), k = Math.min(Math.floor(t), stops.length - 2), f = t - k;
+    for (let c = 0; c < 3; c++) lut[i * 3 + c] = stops[k][c] + (stops[k + 1][c] - stops[k][c]) * f;
+  }
+  return lut;
+}
+const hueLUT = (() => {
+  const lut = new Uint8ClampedArray(360 * 3);
+  for (let hh = 0; hh < 360; hh++) {
+    const k = n => (n + hh / 30) % 12, f = n => 1 - Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1));
+    lut[hh * 3] = f(0) * 255; lut[hh * 3 + 1] = f(8) * 255; lut[hh * 3 + 2] = f(4) * 255;
+  }
+  return lut;
+})();
+
+// ---------- anime world (WebGL) ----------
+// GPU two-pass "anime background" look at full resolution:
+//   1) bilateral filter ×2: flattens texture into smooth painted color regions while keeping edges sharp
+//   2) cel shading: 3 soft-edged tone bands, punchier saturation, cool shadows, warm highlights + ink outlines
+// An optional overlay (the drawn anime face) is composited *before* step 2, so the face and the world
+// get the exact same shading, color grading and outlines — that's what makes it look like one drawing.
+const toon = (() => {
+  const c = document.createElement("canvas");
+  const gl = c.getContext("webgl", { preserveDrawingBuffer: true, premultipliedAlpha: false });
+  if (!gl) return null;
+  const VS = "attribute vec2 p; varying vec2 uv; void main(){ uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }";
+  const SMOOTH = `precision highp float; varying vec2 uv; uniform sampler2D t; uniform vec2 px;
+    void main(){   // bilateral filter: blurs texture/skin, keeps edges (no blocky artifacts)
+      vec3 c0 = texture2D(t, uv).rgb, acc = vec3(0.); float ws = 0.;
+      for (int j = -4; j <= 4; j++) for (int i = -4; i <= 4; i++) {
+        vec2 o = vec2(float(i), float(j));
+        vec3 c = texture2D(t, uv + o * px * 1.5).rgb, d = c - c0;
+        float w = exp(-dot(o, o) / 18.0 - dot(d, d) / 0.025);
+        acc += c * w; ws += w;
+      }
+      gl_FragColor = vec4(acc / ws, 1.0);
+    }`;
+  const CEL = `precision highp float; varying vec2 uv; uniform sampler2D t; uniform sampler2D ov; uniform vec2 px; uniform vec3 tint;
+    vec3 comp(vec2 q){ vec4 o = texture2D(ov, q); return mix(texture2D(t, q).rgb, o.rgb * tint, o.a); }   // world + overlay
+    float lum(vec2 q){ return dot(comp(q), vec3(0.299, 0.587, 0.114)); }
+    vec3 rgb2hsv(vec3 c){ vec4 K = vec4(0., -1./3., 2./3., -1.); vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+      vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r)); float d = q.x - min(q.w, q.y);
+      return vec3(abs(q.z + (q.w - q.y) / (6. * d + 1e-10)), d / (q.x + 1e-10), q.x); }
+    vec3 hsv2rgb(vec3 c){ vec3 p = abs(fract(c.xxx + vec3(1., 2./3., 1./3.)) * 6. - 3.); return c.z * mix(vec3(1.), clamp(p - 1., 0., 1.), c.y); }
+    void main(){
+      vec3 c = comp(uv);
+      vec2 o = px * 1.5;   // sample a bit wide → bolder outlines
+      float tl = lum(uv + vec2(-o.x, o.y)), tc = lum(uv + vec2(0., o.y)), tr = lum(uv + o);
+      float ml = lum(uv - vec2(o.x, 0.)), mr = lum(uv + vec2(o.x, 0.));
+      float bl = lum(uv - o), bc = lum(uv - vec2(0., o.y)), br = lum(uv + vec2(o.x, -o.y));
+      float gx = tr + 2. * mr + br - tl - 2. * ml - bl, gy = tl + 2. * tc + tr - bl - 2. * bc - br;
+      float ink = 0.9 * smoothstep(0.32, 0.6, length(vec2(gx, gy)));
+      vec3 h = rgb2hsv(c);
+      float v = h.z;
+      float band = 0.28 + 0.36 * smoothstep(0.27, 0.31, v) + 0.33 * smoothstep(0.6, 0.64, v);
+      h.z = mix(v, band, 0.75);
+      h.y = min(1., h.y * 1.3 + 0.03);
+      vec3 r = hsv2rgb(h);
+      float shadow = 1. - smoothstep(0.27, 0.33, v), hi = smoothstep(0.6, 0.66, v);
+      r = mix(r, r * vec3(0.82, 0.84, 1.08) + vec3(0.03, 0.0, 0.07), shadow * 0.75);   // cool purple shadows
+      r = mix(r, r * 0.9 + vec3(0.11, 0.095, 0.07), hi * 0.5);                         // warm highlights
+      r = mix(r, vec3(0.16, 0.1, 0.18), ink);
+      gl_FragColor = vec4(r, 1.0);
+    }`;
+  const prog = fs => {
+    const p = gl.createProgram();
+    for (const [type, src] of [[gl.VERTEX_SHADER, VS], [gl.FRAGMENT_SHADER, fs]]) {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      gl.attachShader(p, s);
+    }
+    gl.linkProgram(p); return p;
+  };
+  const passes = [prog(SMOOTH), prog(CEL)];
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  const tex = () => {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+    return t;
+  };
+  const srcTex = tex(), ovTex = tex(), mid = [tex(), tex()], fbos = [gl.createFramebuffer(), gl.createFramebuffer()];
+  const blank = document.createElement("canvas"); blank.width = blank.height = 1;   // fully transparent overlay
+  let W = 0, H = 0;
+  let tint = [1, 1, 1];
+  function draw(p, input, target) {
+    gl.useProgram(p);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target);
+    gl.viewport(0, 0, W, H);
+    const loc = gl.getAttribLocation(p, "p");
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, input);
+    gl.uniform1i(gl.getUniformLocation(p, "t"), 0);
+    gl.uniform2f(gl.getUniformLocation(p, "px"), 1 / W, 1 / H);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, ovTex);
+    gl.uniform1i(gl.getUniformLocation(p, "ov"), 1);
+    gl.uniform3fv(gl.getUniformLocation(p, "tint"), tint);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  return {
+    render(source, overlay = null, overlayTint = [1, 1, 1]) {
+      if (source.width !== W || source.height !== H) {
+        W = c.width = source.width; H = c.height = source.height;
+        for (let k = 0; k < 2; k++) {
+          gl.bindTexture(gl.TEXTURE_2D, mid[k]);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[k]);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, mid[k], 0);
+        }
+      }
+      gl.bindTexture(gl.TEXTURE_2D, srcTex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      gl.bindTexture(gl.TEXTURE_2D, ovTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, overlay ?? blank);
+      tint = overlayTint;
+      draw(passes[0], srcTex, fbos[0]);
+      draw(passes[0], mid[0], fbos[1]);
+      draw(passes[1], mid[1], null);
+      return c;
+    },
+  };
+})();
+
+// ---------- filters: each mutates RGBA data of a w×h region ----------
+const thermalLUT = gradientLUT([[0,0,20],[60,0,120],[200,0,90],[255,80,0],[255,200,0],[255,255,230]]);
+
+const FILTERS = [
+  { name: "Anime", emoji: "🌸", ai: true },         // trained anime model (models/anime_student.onnx, see teacher/)
+  { name: "Avatar", emoji: "🧑‍🎤", character: true }, // a drawn anime character over your face
+  { name: "Cartoon", emoji: "🖍️", toon: true },   // anime world without the drawn face
+  { name: "Old Film", emoji: "🎞️", fn(d, w, h, t) {
+      const flick = 0.88 + Math.random() * 0.14;
+      const scratches = []; for (let k = 0; k < 3; k++) if (Math.random() < 0.35) scratches.push(Math.floor(Math.random() * w));
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const j = (y * w + x) * 4;
+        let l = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+        l = (l - 128) * 1.4 + 128;
+        const dx = x / w - 0.5, dy = y / h - 0.5;
+        l *= (1 - (dx * dx + dy * dy) * 1.6) * flick;
+        l += (Math.random() - 0.5) * 45;
+        for (const s of scratches) if (Math.abs(x - s) < 1) l = l * 0.4 + 140;
+        d[j] = l * 1.02 + 4; d[j + 1] = l; d[j + 2] = l * 0.94;
+      }
+      for (let k = 0; k < 6; k++) { // dust specks
+        const x = Math.floor(Math.random() * w), y = Math.floor(Math.random() * h), r = 1 + Math.random() * 2, v = Math.random() < 0.5 ? 10 : 240;
+        for (let yy = Math.max(0, y - r); yy < Math.min(h, y + r); yy++) for (let xx = Math.max(0, x - r); xx < Math.min(w, x + r); xx++) {
+          const j = (Math.floor(yy) * w + Math.floor(xx)) * 4; d[j] = d[j + 1] = d[j + 2] = v; }
+      }
+  }},
+  { name: "Sepia", emoji: "🟤", fn(d, w, h) {
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const j = (y * w + x) * 4, r = d[j], g = d[j + 1], b = d[j + 2];
+        const dx = x / w - 0.5, dy = y / h - 0.5, v = 1 - (dx * dx + dy * dy) * 1.2;
+        d[j] = (r * .393 + g * .769 + b * .189) * v; d[j + 1] = (r * .349 + g * .686 + b * .168) * v; d[j + 2] = (r * .272 + g * .534 + b * .131) * v;
+      }
+  }},
+  { name: "Comic", emoji: "💥", fn(d, w, h) {
+      const cell = 8, src = d.slice();
+      for (let cy = 0; cy < h; cy += cell) for (let cx = 0; cx < w; cx += cell) {
+        let r = 0, g = 0, b = 0, n = 0;
+        for (let y = cy; y < Math.min(cy + cell, h); y++) for (let x = cx; x < Math.min(cx + cell, w); x++) {
+          const j = (y * w + x) * 4; r += src[j]; g += src[j + 1]; b += src[j + 2]; n++; }
+        r /= n; g /= n; b /= n;
+        const l = 0.299 * r + 0.587 * g + 0.114 * b, rad = (1 - l / 255) * cell * 0.75;
+        const q = v => v > 150 ? 255 : v > 80 ? 200 : 40;        // bold pop-art colors
+        const pr = q(r), pg = q(g), pb = q(b), mx = cx + cell / 2, my = cy + cell / 2;
+        for (let y = cy; y < Math.min(cy + cell, h); y++) for (let x = cx; x < Math.min(cx + cell, w); x++) {
+          const j = (y * w + x) * 4, dist = Math.hypot(x + .5 - mx, y + .5 - my);
+          if (dist < rad) { d[j] = 20; d[j + 1] = 15; d[j + 2] = 35; } else { d[j] = pr; d[j + 1] = pg; d[j + 2] = pb; }
+        }
+      }
+  }},
+  { name: "Thermal", emoji: "🔥", fn(d, w, h) {
+      for (let j = 0; j < d.length; j += 4) {
+        const l = clamp((0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2] - 20) * 1.25, 0, 255) | 0;
+        d[j] = thermalLUT[l * 3]; d[j + 1] = thermalLUT[l * 3 + 1]; d[j + 2] = thermalLUT[l * 3 + 2];
+      }
+  }},
+  { name: "Neon", emoji: "🌈", fn(d, w, h, t) {
+      const E = sobel(blur3(luminance(d, w * h), w, h), w, h), shift = (t * 0.08) | 0;
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const i = y * w + x, j = i * 4, a = clamp((E[i] - 25) / 90, 0, 1);
+        const hh = ((shift + (x / w) * 180 + (y / h) * 180) | 0) % 360;
+        d[j] = hueLUT[hh * 3] * a; d[j + 1] = hueLUT[hh * 3 + 1] * a; d[j + 2] = hueLUT[hh * 3 + 2] * a;
+      }
+  }},
+  { name: "Glitch", emoji: "📺", fn(d, w, h) {
+      const src = d.slice(), band = 6 + (Math.random() * 18 | 0);
+      let off = 0;
+      for (let y = 0; y < h; y++) {
+        if (y % band === 0) off = Math.random() < 0.3 ? ((Math.random() - 0.5) * 40) | 0 : 0;
+        const dim = y % 2 ? 0.8 : 1;
+        for (let x = 0; x < w; x++) {
+          const j = (y * w + x) * 4, at = xx => (y * w + clamp(xx, 0, w - 1)) * 4;
+          d[j] = src[at(x + off + 7)] * dim; d[j + 1] = src[at(x + off) + 1] * dim; d[j + 2] = src[at(x + off - 7) + 2] * dim;
+        }
+      }
+  }},
+  { name: "Pixel", emoji: "👾", fn(d, w, h) {
+      const s = 14;
+      for (let by = 0; by < h; by += s) for (let bx = 0; bx < w; bx += s) {
+        let r = 0, g = 0, b = 0, n = 0;
+        for (let y = by; y < Math.min(by + s, h); y++) for (let x = bx; x < Math.min(bx + s, w); x++) {
+          const j = (y * w + x) * 4; r += d[j]; g += d[j + 1]; b += d[j + 2]; n++; }
+        r /= n; g /= n; b /= n;
+        for (let y = by; y < Math.min(by + s, h); y++) for (let x = bx; x < Math.min(bx + s, w); x++) {
+          const j = (y * w + x) * 4; d[j] = r; d[j + 1] = g; d[j + 2] = b; }
+      }
+  }},
+  { name: "X-Ray", emoji: "🩻", fn(d) {
+      for (let j = 0; j < d.length; j += 4) {
+        const l = 255 - (0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2]);
+        d[j] = l * 0.55; d[j + 1] = l * 0.9; d[j + 2] = Math.min(255, l * 1.1 + 20);
+      }
+  }},
+];
+
+// ---------- UI ----------
+let current = 0;
+let face = null, lastFaceTime = -1;   // smoothed face landmarks for the Anime character (see below)
+const bar = document.getElementById("bar"), hint = document.getElementById("hint");
+FILTERS.forEach((f, i) => {
+  const b = document.createElement("button");
+  b.className = "chip"; b.innerHTML = `<span class="emoji">${f.emoji}</span>${f.name}`;
+  b.onclick = () => select(i);
+  bar.appendChild(b);
+});
+function select(i) {
+  current = (i + FILTERS.length) % FILTERS.length;
+  [...bar.children].forEach((c, k) => c.classList.toggle("active", k === current));
+  bar.children[current].scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
+}
+select(0);
+addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") select(current + 1);
+  if (e.key === "ArrowLeft") select(current - 1);
+  if (e.key === " ") { e.preventDefault(); snapshot(); }
+  if (e.key === "h" || e.key === "H") hairIndex = (hairIndex + 1) % HAIR_COLORS.length;
+  if (e.key === "e" || e.key === "E") eyeIndex = (eyeIndex + 1) % EYE_COLORS.length;
+  if (e.key === "f" || e.key === "F") faceOn = !faceOn;   // compare with / without the dedicated face model
+});
+
+const out = document.getElementById("out"), octx = out.getContext("2d");
+const frame = document.createElement("canvas"), fctx = frame.getContext("2d", { willReadFrequently: true });
+const video = document.getElementById("video");
+
+function snapshot() {
+  const a = document.createElement("a");
+  a.download = `finger-filter-${Date.now()}.png`; a.href = out.toDataURL("image/png"); a.click();
+  const fl = document.getElementById("flash"); fl.style.opacity = 0.8; setTimeout(() => fl.style.opacity = 0, 80);
+}
+document.getElementById("snap").onclick = snapshot;
+
+// ---------- start ----------
+let landmarker, faceLandmarker;
+document.getElementById("go").onclick = async (e) => {
+  const btn = e.currentTarget, err = document.getElementById("err");
+  btn.disabled = true; btn.textContent = "Loading hand tracker…";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1920 }, height: { ideal: 1080 }, facingMode: "user" }, audio: false });
+    video.srcObject = stream; await video.play();
+    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+      runningMode: "VIDEO", numHands: 2,
+    });
+    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+      runningMode: "VIDEO", numFaces: 1,
+    });
+    loadAnimeModel();   // in the background; the other filters work while it loads
+    document.getElementById("start").remove();
+    requestAnimationFrame(loop);
+  } catch (x) {
+    console.error(x);
+    err.textContent = x.name === "NotAllowedError" ? "Camera permission was blocked. Allow it in your browser and try again." : "Couldn't start: " + x.message;
+    btn.disabled = false; btn.textContent = "Try again";
+  }
+};
+
+// ---------- Anime character ----------
+// FaceLandmarker tracks 478 face points; we draw a cel-shaded anime head on top of them:
+// big glossy eyes (follow your gaze + blink), V-shaped face, tiny nose, mouth that opens with yours,
+// blush, and hair with bangs. Everything is drawn in a face-local coordinate system
+// (origin between the eyes, x along the eye line, 1 unit = face width) so it follows head tilt.
+// Keys: H = cycle hair color, E = cycle eye color.
+const HAIR_COLORS = [null, [255, 170, 200], [250, 214, 110], [110, 160, 255], [70, 60, 90], [235, 235, 245]];  // null = match your real hair
+const EYE_COLORS = [[60, 160, 90], [70, 130, 230], [170, 90, 220], [220, 120, 50], [210, 60, 80]];
+let hairIndex = 0, eyeIndex = 0, skinRGB = null, hairRGB = null;
+const INK = "#2a1a2e";
+const FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152,
+  148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
+const BROWS = [[70, 63, 105, 66, 107], [300, 293, 334, 296, 336]];
+
+function trackFace(W, H) {
+  const now = performance.now();
+  if (now <= lastFaceTime) return;
+  lastFaceTime = now;
+  const lm = faceLandmarker.detectForVideo(frame, now).faceLandmarks?.[0];   // frame is already mirrored
+  if (!lm) { face = null; return; }
+  const pts = lm.map(p => ({ x: p.x * W, y: p.y * H }));
+  if (!face || face.length !== pts.length) face = pts;
+  else face.forEach((p, i) => { p.x += (pts[i].x - p.x) * 0.55; p.y += (pts[i].y - p.y) * 0.55; });  // de-jitter
+}
+
+function sampleRGB(x, y, r = 5) {
+  const W = frame.width, H = frame.height;
+  const x0 = clamp(Math.round(x - r), 0, W - 1), y0 = clamp(Math.round(y - r), 0, H - 1);
+  const w = Math.max(1, Math.min(2 * r, W - x0)), h = Math.max(1, Math.min(2 * r, H - y0));
+  const d = fctx.getImageData(x0, y0, w, h).data;
+  let R = 0, G = 0, B = 0;
+  for (let i = 0; i < d.length; i += 4) { R += d[i]; G += d[i + 1]; B += d[i + 2]; }
+  const n = d.length / 4;
+  return [R / n, G / n, B / n];
+}
+const mixRGB = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const css = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+function stylizeHair(c) {   // anime hair: more saturated, never muddy-black
+  const l = (c[0] + c[1] + c[2]) / 3, sat = c.map(v => l + (v - l) * 1.6);
+  const lift = Math.max(0, 75 - l);
+  return sat.map(v => clamp(v + lift, 0, 255));
+}
+
+function drawCharacter(ctx, P) {
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const eyeA = mid(P[33], P[133]), eyeB = mid(P[362], P[263]);
+  const F = Math.hypot(P[454].x - P[234].x, P[454].y - P[234].y);
+  if (F < 30) return;
+  let ux = eyeB.x - eyeA.x, uy = eyeB.y - eyeA.y;
+  const ul = Math.hypot(ux, uy) || 1; ux /= ul; uy /= ul;
+  if (ux < 0) { ux = -ux; uy = -uy; }                         // keep x pointing right on screen
+  const vx = -uy, vy = ux;                                     // y points down the face
+  const O = mid(eyeA, eyeB);
+  const L = i => { const dx = P[i].x - O.x, dy = P[i].y - O.y; return { x: (dx * ux + dy * uy) / F, y: (dx * vx + dy * vy) / F }; };
+  const toImg = (x, y) => ({ x: O.x + (x * ux + y * vx) * F, y: O.y + (x * uy + y * vy) * F });
+
+  // colors (sampled from the camera, smoothed over time so they don't flicker)
+  const c1 = toImg(-0.22, 0.17), c2 = toImg(0.22, 0.17);
+  const skinNow = mixRGB(mixRGB(sampleRGB(c1.x, c1.y), sampleRGB(c2.x, c2.y), 0.5), [255, 228, 212], 0.45);
+  skinRGB = skinRGB ? mixRGB(skinRGB, skinNow, 0.1) : skinNow;
+  const top10 = L(10), hs = toImg(top10.x, top10.y - 0.1);
+  const hairNow = stylizeHair(sampleRGB(hs.x, hs.y, 8));
+  hairRGB = hairRGB ? mixRGB(hairRGB, hairNow, 0.08) : hairNow;
+  const hair = HAIR_COLORS[hairIndex] ?? hairRGB, hairDark = hair.map(v => v * 0.62), hairLight = mixRGB(hair, [255, 255, 255], 0.45);
+  const skin = skinRGB, skinShade = mixRGB(skin, [200, 120, 150], 0.25);
+
+  const chinY = L(152).y, topY = top10.y - 0.3, browY = Math.min(...BROWS.flat().map(i => L(i).y));
+
+  ctx.save();
+  ctx.setTransform(ux * F, uy * F, vx * F, vy * F, O.x, O.y);
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  const ink = w => { ctx.lineWidth = w; ctx.strokeStyle = INK; ctx.stroke(); };
+
+  // --- back hair (behind the head): a bob that ends a bit below the chin
+  ctx.beginPath();
+  ctx.moveTo(-0.6, chinY + 0.12);
+  ctx.bezierCurveTo(-0.78, 0.2, -0.7, topY + 0.08, 0, topY + 0.06);
+  ctx.bezierCurveTo(0.7, topY + 0.08, 0.78, 0.2, 0.6, chinY + 0.12);
+  ctx.quadraticCurveTo(0.45, chinY + 0.02, 0.3, chinY + 0.14);
+  ctx.quadraticCurveTo(0, chinY + 0.05, -0.3, chinY + 0.14);
+  ctx.quadraticCurveTo(-0.45, chinY + 0.02, -0.6, chinY + 0.12);
+  ctx.closePath(); ctx.fillStyle = css(hairDark); ctx.fill(); ink(0.012);
+
+  // --- face: tracked jaw outline, narrowed toward a small pointy anime chin
+  const oval = FACE_OVAL.map(i => {
+    const p = L(i), t = clamp((p.y - 0.12) / (chinY - 0.12), 0, 1);
+    return { x: p.x * (1 - 0.42 * t * t), y: p.y - 0.06 * t * t };
+  });
+  ctx.beginPath();
+  for (let k = 0; k <= oval.length; k++) {
+    const a = oval[k % oval.length], b = oval[(k + 1) % oval.length], m = mid(a, b);
+    k ? ctx.quadraticCurveTo(a.x, a.y, m.x, m.y) : ctx.moveTo(m.x, m.y);
+  }
+  ctx.closePath(); ctx.fillStyle = css(skin); ctx.fill(); ink(0.012);
+  // cel-shadow under the bangs
+  ctx.save(); ctx.clip();
+  ctx.beginPath(); ctx.ellipse(0, browY - 0.02, 0.6, 0.1, 0, 0, Math.PI * 2); ctx.fillStyle = css(skinShade, 0.55); ctx.fill();
+  ctx.restore();
+
+  // --- blush
+  for (const s of [-1, 1]) {
+    ctx.beginPath(); ctx.ellipse(s * 0.25, 0.2, 0.075, 0.035, 0, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,120,150,0.38)"; ctx.fill();
+    ctx.strokeStyle = "rgba(220,80,110,0.55)"; ctx.lineWidth = 0.006;
+    for (let k = -1; k <= 1; k++) { ctx.beginPath(); ctx.moveTo(s * 0.25 + k * 0.03 - 0.01, 0.215); ctx.lineTo(s * 0.25 + k * 0.03 + 0.008, 0.185); ctx.stroke(); }
+  }
+
+  // --- eyes
+  const irises = [L(468), L(473)];
+  const eyeColor = EYE_COLORS[eyeIndex];
+  for (const [ia, ib, iu, il] of [[33, 133, 159, 145], [362, 263, 386, 374]]) {
+    const a = L(ia), b = L(ib), c = mid(a, b), ew = Math.hypot(a.x - b.x, a.y - b.y);
+    const open = clamp((Math.hypot(L(iu).x - L(il).x, L(iu).y - L(il).y) / ew - 0.12) / 0.16, 0, 1);
+    const cx = c.x + Math.sign(c.x) * 0.015, cy = c.y + 0.045, W = 0.26, Ht = 0.3;   // anime-sized eyes
+    if (open < 0.3) {                                          // blink: happy closed-eye curve
+      ctx.beginPath(); ctx.moveTo(cx - W / 2, cy + 0.01); ctx.quadraticCurveTo(cx, cy - 0.06, cx + W / 2, cy + 0.01); ink(0.02);
+      continue;
+    }
+    const lidTop = cy - Ht * 0.55 * open, bot = cy + Ht * 0.45;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(cx - W / 2, cy);
+    ctx.quadraticCurveTo(cx - W * 0.3, lidTop, cx + W * 0.05, lidTop);
+    ctx.quadraticCurveTo(cx + W * 0.45, lidTop + 0.005, cx + W / 2, cy - 0.01);
+    ctx.quadraticCurveTo(cx + W * 0.45, bot, cx, bot);
+    ctx.quadraticCurveTo(cx - W * 0.45, bot, cx - W / 2, cy);
+    ctx.closePath();
+    ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.clip();
+    // iris follows the real iris
+    const ir = irises.reduce((p, q) => (Math.hypot(q.x - c.x, q.y - c.y) < Math.hypot(p.x - c.x, p.y - c.y) ? q : p));
+    const gx = clamp((ir.x - c.x) / ew, -0.3, 0.3) * W * 0.9, gy = clamp((ir.y - c.y) / ew, -0.3, 0.3) * Ht * 0.5;
+    const ix = cx + gx, iy = cy + 0.01 + gy, rx = W * 0.36, ry = Ht * 0.42;
+    const g = ctx.createLinearGradient(0, iy - ry, 0, iy + ry);
+    g.addColorStop(0, css(eyeColor.map(v => v * 0.35))); g.addColorStop(0.55, css(eyeColor)); g.addColorStop(1, css(mixRGB(eyeColor, [255, 255, 255], 0.55)));
+    ctx.beginPath(); ctx.ellipse(ix, iy, rx, ry, 0, 0, Math.PI * 2); ctx.fillStyle = g; ctx.fill(); ink(0.008);
+    ctx.beginPath(); ctx.ellipse(ix, iy + ry * 0.05, rx * 0.45, ry * 0.5, 0, 0, Math.PI * 2); ctx.fillStyle = css(eyeColor.map(v => v * 0.2)); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.ellipse(ix - rx * 0.35, iy - ry * 0.4, rx * 0.34, ry * 0.26, -0.4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ix + rx * 0.35, iy + ry * 0.45, rx * 0.14, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(cx, lidTop, W, 0.025, 0, 0, Math.PI * 2); ctx.fillStyle = "rgba(60,40,80,0.25)"; ctx.fill();  // lid shadow
+    ctx.restore();
+    // lashes: thick upper lid line with a flick at the outer corner, thin lower line
+    const outer = Math.sign(c.x) || 1;
+    ctx.beginPath();
+    ctx.moveTo(cx - W / 2 - 0.005, cy + 0.005);
+    ctx.quadraticCurveTo(cx - W * 0.3, lidTop, cx + W * 0.05, lidTop);
+    ctx.quadraticCurveTo(cx + W * 0.45, lidTop + 0.005, cx + W / 2, cy - 0.01);
+    ink(0.024);
+    const ox = cx + outer * W / 2, oy = cy - (outer > 0 ? 0.01 : 0);
+    ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + outer * 0.035, oy - 0.03); ink(0.016);
+    ctx.beginPath(); ctx.moveTo(cx - W * 0.25, bot - 0.004); ctx.quadraticCurveTo(cx, bot + 0.006, cx + W * 0.25, bot - 0.004); ink(0.007);
+  }
+
+  // --- eyebrows (follow your real brows, so expressions read)
+  for (const ids of BROWS) {
+    const pts = ids.map(i => { const p = L(i); return { x: p.x, y: p.y - 0.04 }; });
+    ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+    for (let k = 1; k < pts.length - 1; k++) { const m = mid(pts[k], pts[k + 1]); ctx.quadraticCurveTo(pts[k].x, pts[k].y, m.x, m.y); }
+    ctx.lineTo(pts.at(-1).x, pts.at(-1).y);
+    ctx.lineWidth = 0.014; ctx.strokeStyle = css(hairDark.map(v => v * 0.8)); ctx.stroke();
+  }
+
+  // --- nose: a tiny tick
+  const n = L(4);
+  ctx.beginPath(); ctx.moveTo(n.x - 0.004, n.y - 0.02); ctx.lineTo(n.x + 0.008, n.y); ctx.lineWidth = 0.008; ctx.strokeStyle = css(skinShade.map(v => v * 0.7)); ctx.stroke();
+
+  // --- mouth: small smile when closed, big "D" mouth with tongue when open
+  const m1 = L(61), m2 = L(291), up = L(13), lo = L(14);
+  const mw = Math.hypot(m1.x - m2.x, m1.y - m2.y), openR = Math.hypot(up.x - lo.x, up.y - lo.y) / mw;
+  const mx = (up.x + lo.x) / 2, my = Math.min((up.y + lo.y) / 2, chinY - 0.12), aw = clamp(mw * 0.75, 0.08, 0.2);
+  if (openR < 0.12) {
+    const smile = clamp((((m1.y + m2.y) / 2) - my) * -4, -0.02, 0.03) + 0.015;
+    ctx.beginPath(); ctx.moveTo(mx - aw / 2, my); ctx.quadraticCurveTo(mx, my + smile * 2, mx + aw / 2, my); ink(0.012);
+  } else {
+    const oh = clamp(openR, 0.12, 0.9) * aw * 1.3, ty = my - oh * 0.3, lx = mx - aw / 2, rx = mx + aw / 2;
+    ctx.beginPath();
+    ctx.moveTo(lx, ty);
+    ctx.quadraticCurveTo(mx, ty - oh * 0.12, rx, ty);
+    ctx.bezierCurveTo(rx, ty + oh * 0.65, mx + aw * 0.28, ty + oh, mx, ty + oh);
+    ctx.bezierCurveTo(mx - aw * 0.28, ty + oh, lx, ty + oh * 0.65, lx, ty);
+    ctx.closePath();
+    ctx.fillStyle = "#6e1a2a"; ctx.fill();
+    ctx.save(); ctx.clip();
+    ctx.beginPath(); ctx.ellipse(mx, ty + oh * 0.95, aw * 0.32, oh * 0.38, 0, 0, Math.PI * 2); ctx.fillStyle = "#ff7d93"; ctx.fill();
+    ctx.restore();
+    ctx.beginPath();
+    ctx.moveTo(lx, ty); ctx.quadraticCurveTo(mx, ty - oh * 0.12, rx, ty);
+    ctx.bezierCurveTo(rx, ty + oh * 0.65, mx + aw * 0.28, ty + oh, mx, ty + oh);
+    ctx.bezierCurveTo(mx - aw * 0.28, ty + oh, lx, ty + oh * 0.65, lx, ty);
+    ink(0.012);
+  }
+
+  // --- front hair: crown + pointed bangs + side locks framing the face
+  const tipY = browY + 0.01, valY = browY - 0.12, side = 0.58;
+  ctx.beginPath();
+  ctx.moveTo(-side, 0.02);
+  ctx.bezierCurveTo(-side - 0.06, topY + 0.05, -0.25, topY - 0.06, 0, topY - 0.06);
+  ctx.bezierCurveTo(0.25, topY - 0.06, side + 0.06, topY + 0.05, side, 0.02);
+  ctx.quadraticCurveTo(side - 0.02, chinY * 0.6, 0.5, chinY * 0.95);           // right side lock tip
+  ctx.quadraticCurveTo(0.47, 0.25, 0.42, 0.0);
+  const tips = [0.33, 0.17, 0.0, -0.17, -0.33];                                    // bang strands, right → left
+  let px = 0.42, py = 0.0;
+  tips.forEach((tx, k) => {
+    const ty = tipY + (k % 2 ? 0.0 : 0.025);
+    const vx = (px + tx) / 2, vy = k === 0 ? valY + 0.04 : valY;
+    ctx.quadraticCurveTo(px - 0.01, (py + vy) / 2, vx, vy);                         // up into the valley
+    ctx.quadraticCurveTo(tx + 0.02, (vy + ty) / 2, tx, ty);                         // down to a pointed tip
+    px = tx; py = ty;
+  });
+  ctx.quadraticCurveTo(-0.38, valY + 0.04, -0.42, 0.0);
+  ctx.quadraticCurveTo(-0.47, 0.25, -0.5, chinY * 0.95);                          // left side lock tip
+  ctx.quadraticCurveTo(-side + 0.02, chinY * 0.6, -side, 0.02);
+  ctx.closePath();
+  ctx.fillStyle = css(hair); ctx.fill();
+  ctx.save(); ctx.clip();                                                         // shine band
+  ctx.beginPath(); ctx.ellipse(0, topY + 0.13, 0.36, 0.06, 0, Math.PI * 1.05, Math.PI * 1.95);
+  ctx.lineWidth = 0.035; ctx.strokeStyle = css(hairLight, 0.85); ctx.stroke();
+  ctx.lineWidth = 0.008; ctx.strokeStyle = css(hairDark);                        // strand lines
+  for (const sx of [-0.3, -0.1, 0.1, 0.3]) {
+    ctx.beginPath(); ctx.moveTo(sx * 0.6, topY + 0.06); ctx.quadraticCurveTo(sx * 1.05, (topY + valY) / 2 + 0.05, sx * 1.1, valY + 0.07); ctx.stroke();
+  }
+  ctx.restore();
+  ink(0.013);
+  // ahoge: the little antenna strand on top
+  ctx.beginPath();
+  ctx.moveTo(-0.03, topY - 0.04);
+  ctx.bezierCurveTo(-0.06, topY - 0.16, 0.08, topY - 0.2, 0.1, topY - 0.14);
+  ctx.bezierCurveTo(0.04, topY - 0.15, 0.0, topY - 0.1, 0.03, topY - 0.045);
+  ctx.closePath(); ctx.fillStyle = css(hair); ctx.fill(); ink(0.01);
+
+  ctx.restore();
+}
+
+// ---------- AI anime (trained model) ----------
+// models/anime_student.onnx is a small network trained to imitate a Stable Diffusion anime "teacher" on thousands
+// of photos of different people (see teacher/). It runs in the browser on the GPU via onnxruntime-web (WebGPU).
+// Inference is asynchronous: the newest result is drawn every frame while the next one computes.
+// The model looks at a zoomed-in 4:3 crop around the finger shape, not the whole camera frame: at full-frame scale
+// a face is only ~80px wide and the model can't draw anime features into it. The size is fixed so the GPU
+// doesn't have to recompile for a new tensor shape every frame.
+const AI_W = 448, AI_H = 336;
+// The model draws at 448x336; Anime4K (an upscaler made for anime line art) doubles that on the GPU so lines stay
+// crisp instead of being blurred by plain stretching.
+const OUT_W = AI_W * 2, OUT_H = AI_H * 2, UPSCALER = "CNNx2VL";   // ~2.7 ms; "CNNx2UL" is sharper (~7 ms)
+const aiIn = document.createElement("canvas"), aictx = aiIn.getContext("2d", { willReadFrequently: true });
+const aiOut = document.createElement("canvas"), aoctx = aiOut.getContext("2d");
+aiIn.width = AI_W; aiIn.height = AI_H; aiOut.width = OUT_W; aiOut.height = OUT_H;
+const aiImg = new ImageData(AI_W, AI_H);
+let aiSession = null, aiBusy = false, aiReady = false, aiRect = null, aiCrop = null;
+const aiNew = document.createElement("canvas"), anctx = aiNew.getContext("2d");
+aiNew.width = AI_W; aiNew.height = AI_H;
+
+// Anti-flicker 1: hold the zoom steady. Re-zooming every frame as the fingers jitter makes the model redraw
+// everything slightly differently, so only follow the finger shape once it has really moved or resized.
+function steadyCrop(t) {
+  if (!aiCrop) return (aiCrop = t);
+  const moved = Math.hypot(t.x + t.w / 2 - aiCrop.x - aiCrop.w / 2, t.y + t.h / 2 - aiCrop.y - aiCrop.h / 2) / aiCrop.w;
+  const resized = Math.abs(t.w / aiCrop.w - 1);
+  if (moved < 0.06 && resized < 0.1) return aiCrop;                      // small jitter: keep the same crop
+  const k = 0.35;                                                          // real movement: glide toward it
+  aiCrop = { x: aiCrop.x + (t.x - aiCrop.x) * k, y: aiCrop.y + (t.y - aiCrop.y) * k,
+             w: aiCrop.w + (t.w - aiCrop.w) * k, h: aiCrop.h + (t.h - aiCrop.h) * k };
+  return aiCrop;
+}
+
+// 4:3 rectangle around the finger shape (+20% padding), kept inside the camera frame.
+function animeCrop(pts, W, H) {
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  let w = (Math.max(...xs) - Math.min(...xs)) * 1.2, h = (Math.max(...ys) - Math.min(...ys)) * 1.2;
+  w = Math.max(w, h * 4 / 3, 320); h = w * 3 / 4;                // 4:3, and never zoom in past ~1.4x
+  if (w > W) { w = W; h = w * 3 / 4; }
+  if (h > H) { h = H; w = h * 4 / 3; }
+  return { x: clamp(cx - w / 2, 0, W - w), y: clamp(cy - h / 2, 0, H - h), w, h };
+}
+
+// GPU path: on Macs WebGPU runs on Metal. Camera frame → crop/resize/normalise (compute shader) → model → colours
+// (render shader) all stay on the GPU; nothing is copied back to JavaScript. Falls back to the CPU path if unavailable.
+const aiGpuCanvas = document.createElement("canvas");
+aiGpuCanvas.width = OUT_W; aiGpuCanvas.height = OUT_H;
+let gpu = null;
+
+const PRE_WGSL = /* wgsl */`
+  struct P { crop: vec4f, size: vec2f, mirror: f32, pad: f32 };
+  @group(0) @binding(0) var src: texture_2d<f32>;
+  @group(0) @binding(1) var samp: sampler;
+  @group(0) @binding(2) var<uniform> p: P;
+  @group(0) @binding(3) var<storage, read_write> outBuf: array<f32>;
+  @compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) id: vec3u) {
+    let W = u32(p.size.x); let H = u32(p.size.y);
+    if (id.x >= W || id.y >= H) { return; }
+    var uv = p.crop.xy + (vec2f(id.xy) + 0.5) / p.size * p.crop.zw;   // crop in (mirrored) frame space
+    if (p.mirror > 0.5) { uv.x = 1.0 - uv.x; }                         // the raw camera image isn't mirrored
+    let c = textureSampleLevel(src, samp, uv, 0.0).rgb * 2.0 - 1.0;   // [-1, 1] like in training
+    let i = id.y * W + id.x; let n = W * H;
+    outBuf[i] = c.r; outBuf[n + i] = c.g; outBuf[2u * n + i] = c.b;
+  }`;
+const POST_WGSL = /* wgsl */`
+  @group(0) @binding(0) var<storage, read> y: array<f32>;
+  @group(0) @binding(1) var<uniform> size: vec2f;
+  @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let xy = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(xy * 2.0 - 1.0, 0.0, 1.0);
+  }
+  @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let W = u32(size.x); let n = W * u32(size.y); let i = u32(pos.y) * W + u32(pos.x);
+    return vec4f(clamp((vec3f(y[i], y[n + i], y[2u * n + i]) + 1.0) * 0.5, vec3f(0.0), vec3f(1.0)), 1.0);
+  }`;
+const BLIT_WGSL = /* wgsl */`
+  @group(0) @binding(0) var t: texture_2d<f32>;
+  @group(0) @binding(1) var s: sampler;
+  @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let xy = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(xy * 2.0 - 1.0, 0.0, 1.0);
+  }
+  @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    return vec4f(textureSampleLevel(t, s, pos.xy / vec2f(${OUT_W}.0, ${OUT_H}.0), 0.0).rgb, 1.0);
+  }`;
+
+async function setupGpu() {
+  const device = await ort.env.webgpu.device;           // share ONNX Runtime's GPU device so buffers can be passed directly
+  if (!device) throw new Error("no WebGPU device");
+  const ctx = aiGpuCanvas.getContext("webgpu"), format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: "opaque" });
+  const n = AI_W * AI_H;
+  const inBuf = device.createBuffer({ size: 3 * n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const sizeBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(sizeBuf, 0, new Float32Array([AI_W, AI_H]));
+  const pre = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: PRE_WGSL }), entryPoint: "main" } });
+  const postModule = device.createShaderModule({ code: POST_WGSL });
+  // 448x336 models: output → rgba16float texture → Anime4K 2x upscale → canvas.
+  // 896x672 models (FastStudent2x) already draw at display size: output → canvas directly (postDirect).
+  const post = device.createRenderPipeline({ layout: "auto", vertex: { module: postModule, entryPoint: "vs" },
+    fragment: { module: postModule, entryPoint: "fs", targets: [{ format: "rgba16float" }] }, primitive: { topology: "triangle-list" } });
+  const postDirect = device.createRenderPipeline({ layout: "auto", vertex: { module: postModule, entryPoint: "vs" },
+    fragment: { module: postModule, entryPoint: "fs", targets: [{ format }] }, primitive: { topology: "triangle-list" } });
+  const sizeOutBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(sizeOutBuf, 0, new Float32Array([OUT_W, OUT_H]));
+  const outTex = device.createTexture({ size: [AI_W, AI_H], format: "rgba16float",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.STORAGE_BINDING });
+  let up = null;
+  try { up = new Anime4K[UPSCALER]({ device, inputTexture: outTex }); }
+  catch (e) { console.warn("Anime4K unavailable, using plain upscaling", e); }
+  const blitModule = device.createShaderModule({ code: BLIT_WGSL });
+  const blit = device.createRenderPipeline({ layout: "auto", vertex: { module: blitModule, entryPoint: "vs" },
+    fragment: { module: blitModule, entryPoint: "fs", targets: [{ format }] }, primitive: { topology: "triangle-list" } });
+  const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+  const blitBind = device.createBindGroup({ layout: blit.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: (up ? up.getOutputTexture() : outTex).createView() }, { binding: 1, resource: sampler }] });
+  gpu = { device, ctx, inBuf, params, sizeBuf, sizeOutBuf, pre, post, postDirect, sampler, srcTex: null, outTex, up, blit, blitBind,
+          input: ort.Tensor.fromGpuBuffer(inBuf, { dataType: "float32", dims: [1, 3, AI_H, AI_W] }) };
+}
+
+async function loadAnimeModel() {
+  try {
+    aiSession = await ort.InferenceSession.create("models/anime_student.onnx",
+      { executionProviders: ["webgpu"], preferredOutputLocation: "gpu-buffer" });
+  } catch (e) {
+    console.warn("WebGPU unavailable, running the model on the CPU (slow)", e);
+    try { aiSession = await ort.InferenceSession.create("models/anime_student.onnx", { executionProviders: ["wasm"] }); }
+    catch (e2) { console.error("anime model failed to load", e2); }
+    return;
+  }
+  try { await setupGpu(); } catch (e) { console.warn("GPU pre/post-processing unavailable, using CPU path", e); gpu = null; }
+  if (gpu) await loadFaceModel();
+}
+
+// Writes the model's input tensor on the GPU for crop r of the (mirrored) W×H frame.
+function gpuPrepare(r, W, H) {        // expects uploadSource() to have filled gpu.srcTex for this frame
+  const { device } = gpu;
+  const useVideo = video.readyState >= 2 && video.videoWidth === W;
+  device.queue.writeBuffer(gpu.params, 0, new Float32Array([r.x / W, r.y / H, r.w / W, r.h / H, AI_W, AI_H, useVideo ? 1 : 0, 0]));
+  const bind = device.createBindGroup({ layout: gpu.pre.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: gpu.srcTex.createView() }, { binding: 1, resource: gpu.sampler },
+    { binding: 2, resource: { buffer: gpu.params } }, { binding: 3, resource: { buffer: gpu.inBuf } }] });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(gpu.pre); pass.setBindGroup(0, bind);
+  pass.dispatchWorkgroups(Math.ceil(AI_W / 16), Math.ceil(AI_H / 16)); pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+// Draws the model's output tensor (still on the GPU), upscaled 2x by Anime4K, into aiGpuCanvas.
+function gpuDraw(y) {
+  const { device } = gpu;
+  const enc = device.createCommandEncoder();
+  if (y.dims[3] === OUT_W) {                                   // model already drew at 896x672: no upscaling needed
+    const bind = device.createBindGroup({ layout: gpu.postDirect.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: y.gpuBuffer } }, { binding: 1, resource: { buffer: gpu.sizeOutBuf } }] });
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: gpu.ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store" }] });
+    pass.setPipeline(gpu.postDirect); pass.setBindGroup(0, bind); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+    return;
+  }
+  const bind = device.createBindGroup({ layout: gpu.post.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: y.gpuBuffer } }, { binding: 1, resource: { buffer: gpu.sizeBuf } }] });
+  let pass = enc.beginRenderPass({ colorAttachments: [{ view: gpu.outTex.createView(), loadOp: "clear", storeOp: "store" }] });
+  pass.setPipeline(gpu.post); pass.setBindGroup(0, bind); pass.draw(3); pass.end();
+  gpu.up?.pass(enc);
+  pass = enc.beginRenderPass({ colorAttachments: [{ view: gpu.ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store" }] });
+  pass.setPipeline(gpu.blit); pass.setBindGroup(0, gpu.blitBind); pass.draw(3); pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+// How much the picture inside the crop changed since the last model run (0 = identical), from a 32x24 thumbnail.
+const motionCan = document.createElement("canvas"), mctx = motionCan.getContext("2d", { willReadFrequently: true });
+motionCan.width = 32; motionCan.height = 24;
+let lastThumb = null;
+function cropMotion(r) {
+  mctx.drawImage(frame, r.x, r.y, r.w, r.h, 0, 0, 32, 24);
+  const d = mctx.getImageData(0, 0, 32, 24).data;
+  const prev = lastThumb;
+  lastThumb = d;
+  if (!prev) return 1;                                                    // nothing to compare with yet: treat as moving
+  let diff = 0;
+  for (let i = 0; i < d.length; i += 4) diff += Math.abs(d[i] - prev[i]) + Math.abs(d[i + 1] - prev[i + 1]);
+  return diff / (32 * 24 * 2 * 255);
+}
+
+// ---------- dedicated face model ----------
+// The scene model works at low internal resolution, so lips/teeth/eyes get only a few pixels. A second, small model
+// (models/anime_face.onnx, teacher/train_face.py) redraws just the face: the face is cut out upright at 256x256 with
+// the eyes and mouth at fixed spots (same alignment as training), redrawn, warped back and blended in with a soft oval.
+const FACE = 256;
+const FACE_ALIGN = [[0.35 * FACE, 0.40 * FACE], [0.65 * FACE, 0.40 * FACE], [0.50 * FACE, 0.73 * FACE]];  // = teacher/align_faces.py ALIGN
+let faceSession = null, faceReady = false, faceXf = null, fgpu = null, frameNo = 0, faceOn = true;   // F key toggles
+const faceCanvas = document.createElement("canvas");
+faceCanvas.width = faceCanvas.height = FACE;
+
+// Least-squares similarity transform (rotation + uniform scale + shift) mapping points src → dst: x' = a x − b y + tx.
+function similarity(src, dst) {
+  const n = src.length, ms = [0, 0], md = [0, 0];
+  for (let i = 0; i < n; i++) { ms[0] += src[i][0] / n; ms[1] += src[i][1] / n; md[0] += dst[i][0] / n; md[1] += dst[i][1] / n; }
+  let na = 0, nb = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    const sx = src[i][0] - ms[0], sy = src[i][1] - ms[1], dx = dst[i][0] - md[0], dy = dst[i][1] - md[1];
+    na += sx * dx + sy * dy; nb += sx * dy - sy * dx; den += sx * sx + sy * sy;
+  }
+  const a = na / den, b = nb / den;
+  return { a, b, tx: md[0] - (a * ms[0] - b * ms[1]), ty: md[1] - (b * ms[0] + a * ms[1]) };
+}
+
+// Transform from the aligned 256x256 face crop to (mirrored) frame pixels, or null if no usable face.
+function faceTransform() {
+  if (!face) return null;
+  const avg = ids => ids.reduce((s, i) => [s[0] + face[i].x / ids.length, s[1] + face[i].y / ids.length], [0, 0]);
+  let e1 = avg([33, 133]), e2 = avg([362, 263]);
+  if (e1[0] > e2[0]) [e1, e2] = [e2, e1];                    // screen-left eye → left slot (the view is mirrored)
+  if (Math.hypot(e2[0] - e1[0], e2[1] - e1[1]) < 30) return null;   // face too small to be worth a close-up
+  return similarity(FACE_ALIGN, [e1, e2, avg([13, 14, 61, 291])]);
+}
+
+const FACE_PRE_WGSL = /* wgsl */`
+  struct P { xf: vec4f, frame: vec2f, mirror: f32, pad: f32 };   // xf = (a, b, tx, ty): aligned → frame pixels
+  @group(0) @binding(0) var src: texture_2d<f32>;
+  @group(0) @binding(1) var samp: sampler;
+  @group(0) @binding(2) var<uniform> p: P;
+  @group(0) @binding(3) var<storage, read_write> outBuf: array<f32>;
+  @compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) id: vec3u) {
+    if (id.x >= ${FACE}u || id.y >= ${FACE}u) { return; }
+    let q = vec2f(id.xy) + 0.5;
+    let f = vec2f(p.xf.x * q.x - p.xf.y * q.y + p.xf.z, p.xf.y * q.x + p.xf.x * q.y + p.xf.w);
+    var uv = f / p.frame;
+    if (p.mirror > 0.5) { uv.x = 1.0 - uv.x; }
+    let c = textureSampleLevel(src, samp, uv, 0.0).rgb * 2.0 - 1.0;
+    let i = id.y * ${FACE}u + id.x; let n = ${FACE * FACE}u;
+    outBuf[i] = c.r; outBuf[n + i] = c.g; outBuf[2u * n + i] = c.b;
+  }`;
+const FACE_POST_WGSL = /* wgsl */`
+  @group(0) @binding(0) var<storage, read> y: array<f32>;
+  @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let xy = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(xy * 2.0 - 1.0, 0.0, 1.0);
+  }
+  @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let i = u32(pos.y) * ${FACE}u + u32(pos.x); let n = ${FACE * FACE}u;
+    let rgb = clamp((vec3f(y[i], y[n + i], y[2u * n + i]) + 1.0) * 0.5, vec3f(0.0), vec3f(1.0));
+    let d = (pos.xy / ${FACE}.0 - vec2f(0.5, 0.56)) / vec2f(0.40, 0.48);          // soft oval around the face
+    let m = 1.0 - smoothstep(0.75, 1.0, length(d));
+    return vec4f(rgb * m, m);                                                      // premultiplied alpha
+  }`;
+
+async function loadFaceModel() {
+  try {
+    faceSession = await ort.InferenceSession.create("models/anime_face.onnx",
+      { executionProviders: ["webgpu"], preferredOutputLocation: "gpu-buffer" });
+    const device = gpu.device, n = FACE * FACE;
+    const ctx = faceCanvas.getContext("webgpu"), format = navigator.gpu.getPreferredCanvasFormat();
+    ctx.configure({ device, format, alphaMode: "premultiplied" });
+    const inBuf = device.createBuffer({ size: 3 * n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const pre = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: FACE_PRE_WGSL }), entryPoint: "main" } });
+    const pm = device.createShaderModule({ code: FACE_POST_WGSL });
+    const post = device.createRenderPipeline({ layout: "auto", vertex: { module: pm, entryPoint: "vs" },
+      fragment: { module: pm, entryPoint: "fs", targets: [{ format }] }, primitive: { topology: "triangle-list" } });
+    fgpu = { ctx, inBuf, params, pre, post, input: ort.Tensor.fromGpuBuffer(inBuf, { dataType: "float32", dims: [1, 3, FACE, FACE] }) };
+  } catch (e) {
+    console.info("no face model yet (models/anime_face.onnx) — faces use the scene model only", e?.message ?? e);
+    faceSession = null;
+  }
+}
+
+// Copies the current camera frame into gpu.srcTex (shared by the scene and face models).
+function uploadSource(W, H) {
+  const { device } = gpu;
+  const useVideo = video.readyState >= 2 && video.videoWidth === W;    // raw camera frame: skip the 2D canvas entirely
+  if (!gpu.srcTex || gpu.srcTex.width !== W || gpu.srcTex.height !== H) {
+    gpu.srcTex?.destroy();
+    gpu.srcTex = device.createTexture({ size: [W, H], format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
+  }
+  device.queue.copyExternalImageToTexture({ source: useVideo ? video : frame }, { texture: gpu.srcTex }, [W, H]);
+  return useVideo;
+}
+
+async function runFace(W, H, mirror) {
+  const xf = faceTransform();
+  if (!xf) { faceReady = false; return; }
+  const { device } = gpu;
+  device.queue.writeBuffer(fgpu.params, 0, new Float32Array([xf.a, xf.b, xf.tx, xf.ty, W, H, mirror ? 1 : 0, 0]));
+  const bind = device.createBindGroup({ layout: fgpu.pre.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: gpu.srcTex.createView() }, { binding: 1, resource: gpu.sampler },
+    { binding: 2, resource: { buffer: fgpu.params } }, { binding: 3, resource: { buffer: fgpu.inBuf } }] });
+  let enc = device.createCommandEncoder(); const cp = enc.beginComputePass();
+  cp.setPipeline(fgpu.pre); cp.setBindGroup(0, bind); cp.dispatchWorkgroups(FACE / 16, FACE / 16); cp.end();
+  device.queue.submit([enc.finish()]);
+  const { y } = await faceSession.run({ x: fgpu.input });
+  const pb = device.createBindGroup({ layout: fgpu.post.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: y.gpuBuffer } }] });
+  enc = device.createCommandEncoder();
+  const rp = enc.beginRenderPass({ colorAttachments: [{ view: fgpu.ctx.getCurrentTexture().createView(), clearValue: [0, 0, 0, 0], loadOp: "clear", storeOp: "store" }] });
+  rp.setPipeline(fgpu.post); rp.setBindGroup(0, pb); rp.draw(3); rp.end();
+  device.queue.submit([enc.finish()]);
+  y.dispose();
+  faceXf = xf; faceReady = true;
+}
+
+async function runAnime(pts, W, H) {
+  if (!aiSession || aiBusy) return;
+  aiBusy = true;
+  try {
+    const r = steadyCrop(animeCrop(pts, W, H));
+    const motion = cropMotion(r);
+    let drawn;
+    frameNo++;
+    // With a face model running, the scene (background, body) is redrawn every other frame and the face every frame:
+    // backgrounds barely change between frames, and the face is where motion matters.
+    const sceneDue = !faceSession || !faceOn || !aiReady || aiRect !== r || frameNo % 2 === 0;
+    if (gpu) {
+      const mirror = uploadSource(W, H);
+      if (faceSession && fgpu && faceOn) await runFace(W, H, mirror);
+      if (!sceneDue) return;
+      gpuPrepare(r, W, H);
+      const { y } = await aiSession.run({ x: gpu.input });
+      gpuDraw(y);
+      y.dispose();
+      drawn = aiGpuCanvas;
+    } else {                                                            // CPU fallback
+      aictx.drawImage(frame, r.x, r.y, r.w, r.h, 0, 0, AI_W, AI_H);   // frame is already mirrored
+      const px = aictx.getImageData(0, 0, AI_W, AI_H).data, n = AI_W * AI_H, input = new Float32Array(3 * n);
+      for (let i = 0; i < n; i++) {
+        input[i] = px[i * 4] / 127.5 - 1; input[n + i] = px[i * 4 + 1] / 127.5 - 1; input[2 * n + i] = px[i * 4 + 2] / 127.5 - 1;
+      }
+      const { y } = await aiSession.run({ x: new ort.Tensor("float32", input, [1, 3, AI_H, AI_W]) });
+      const o = await y.getData(), d = aiImg.data;
+      for (let i = 0; i < n; i++) {
+        d[i * 4] = (o[i] + 1) * 127.5; d[i * 4 + 1] = (o[n + i] + 1) * 127.5; d[i * 4 + 2] = (o[2 * n + i] + 1) * 127.5; d[i * 4 + 3] = 255;
+      }
+      y.dispose();
+      anctx.putImageData(aiImg, 0, 0);
+      drawn = aiNew;
+    }
+    // Anti-flicker 2: only while the picture is nearly still, blend the new drawing into the previous one to
+    // average out tiny jitter. When you move or talk, show the new frame as-is so motion stays sharp (no smear).
+    const still = aiReady && aiRect === r && motion < 0.02;
+    aoctx.globalAlpha = still ? 0.6 : 1;
+    aoctx.drawImage(drawn, 0, 0, OUT_W, OUT_H);
+    aoctx.globalAlpha = 1;
+    aiRect = r; aiReady = true;
+  } catch (e) {
+    console.error("anime model failed", e);
+  } finally {
+    aiBusy = false;
+  }
+}
+
+// ---------- main loop ----------
+let lastVideoTime = -1, result = null;
+let shape = [], alpha = 0;   // smoothed polygon points, connected in order
+
+// Build the polygon straight from fingertip to fingertip.
+// Two hands: L thumb → L index → R index → R thumb. Flip a hand upside down and
+// the lines cross, so you get two triangles touching in the middle (a bowtie).
+// One hand: thumb tip → index tip → the web between thumb and index (a triangle).
+function targetShape(hands, W, H) {
+  const P = (lm, k) => ({ x: (1 - lm[k].x) * W, y: lm[k].y * H });
+  if (hands.length >= 2) {
+    const [a, b] = [...hands].sort((h1, h2) => P(h1, 0).x - P(h2, 0).x);
+    return [P(a, 4), P(a, 8), P(b, 8), P(b, 4)];
+  }
+  if (hands.length === 1) {
+    const lm = hands[0], p2 = P(lm, 2), p5 = P(lm, 5);
+    return [P(lm, 4), P(lm, 8), { x: (p2.x + p5.x) / 2, y: (p2.y + p5.y) / 2 }];
+  }
+  return null;
+}
+
+function loop(t) {
+  const W = video.videoWidth, H = video.videoHeight;
+  if (W && H) {
+    if (out.width !== W || out.height !== H) { out.width = frame.width = W; out.height = frame.height = H; }
+    // mirrored camera frame
+    fctx.setTransform(-1, 0, 0, 1, W, 0); fctx.drawImage(video, 0, 0, W, H); fctx.setTransform(1, 0, 0, 1, 0, 0);
+    octx.drawImage(frame, 0, 0);
+
+    if (video.currentTime !== lastVideoTime) { lastVideoTime = video.currentTime; result = landmarker.detectForVideo(video, performance.now()); }
+
+    const target = targetShape(result?.landmarks ?? [], W, H);
+    if (target) {
+      if (shape.length !== target.length) shape = target.map(p => ({ ...p }));   // hand count changed: snap
+      else shape.forEach((p, i) => { p.x += (target[i].x - p.x) * 0.5; p.y += (target[i].y - p.y) * 0.5; });
+      alpha = Math.min(1, alpha + 0.2);
+    } else {
+      alpha = Math.max(0, alpha - 0.1);
+      if (alpha === 0) aiCrop = null;   // hands gone: next time, zoom straight to the new shape
+    }
+
+    hint.style.opacity = target ? 0 : 1;
+    hint.textContent = "Show your hand and spread your thumb + pointer finger ✌️";
+
+    if ((FILTERS[current].character || (FILTERS[current].ai && faceSession)) && alpha > 0 && shape.length) trackFace(W, H);
+    if (FILTERS[current].ai && alpha > 0 && shape.length) runAnime(shape, W, H);
+    if (alpha > 0 && shape.length) drawFiltered(shape, W, H, t);
+  }
+  requestAnimationFrame(loop);
+}
+
+function tracePath(pts) {
+  octx.beginPath();
+  pts.forEach((p, i) => i ? octx.lineTo(p.x, p.y) : octx.moveTo(p.x, p.y));
+  octx.closePath();
+}
+
+function drawFiltered(pts, W, H, t) {
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const x = Math.floor(clamp(Math.min(...xs), 0, W)), y = Math.floor(clamp(Math.min(...ys), 0, H));
+  const w = Math.ceil(clamp(Math.max(...xs), 0, W)) - x, h = Math.ceil(clamp(Math.max(...ys), 0, H)) - y;
+  if (w < 4 || h < 4) return;
+
+  octx.save();
+  octx.globalAlpha = alpha;
+  tracePath(pts); octx.clip("nonzero");
+  if (FILTERS[current].ai) {
+    octx.imageSmoothingQuality = "high";
+    octx.drawImage(frame, 0, 0);                                    // underneath, in case the shape outgrew the last crop
+    if (aiReady) octx.drawImage(aiOut, aiRect.x, aiRect.y, aiRect.w, aiRect.h);
+    if (aiReady && faceOn && faceReady && faceXf) {                 // warp the redrawn face back into place
+      octx.save();
+      octx.setTransform(faceXf.a, faceXf.b, -faceXf.b, faceXf.a, faceXf.tx, faceXf.ty);
+      octx.drawImage(faceCanvas, 0, 0);
+      octx.restore();
+    }
+  } else if (FILTERS[current].character || FILTERS[current].toon) {
+    const withFace = FILTERS[current].character && face;
+    if (withFace) {                                               // draw the face on its own layer…
+      if (faceLayer.width !== W || faceLayer.height !== H) { faceLayer.width = W; faceLayer.height = H; }
+      flctx.clearRect(0, 0, W, H);
+      drawCharacter(flctx, face);
+    }
+    if (toon) octx.drawImage(toon.render(frame, withFace ? faceLayer : null, sceneTint()), 0, 0);  // …then shade it together with the world
+    else {
+      octx.filter = "saturate(1.6) contrast(1.1) blur(1.5px)"; octx.drawImage(frame, 0, 0); octx.filter = "none";
+      if (withFace) octx.drawImage(faceLayer, 0, 0);
+    }
+  } else {
+    const img = fctx.getImageData(x, y, w, h);
+    FILTERS[current].fn(img.data, w, h, t);
+    // putImageData ignores clipping/alpha, so stage it on a scratch canvas, then clip to the finger shape
+    scratch.width = w; scratch.height = h; sctx.putImageData(img, 0, 0);
+    octx.drawImage(scratch, x, y);
+  }
+  octx.restore();
+
+  octx.save();
+  octx.globalAlpha = alpha;
+  octx.lineWidth = 4; octx.lineJoin = "round"; octx.strokeStyle = "#fff";
+  octx.shadowColor = "rgba(255,210,63,.9)"; octx.shadowBlur = 16;
+  tracePath(pts); octx.stroke();
+  octx.shadowBlur = 0; octx.fillStyle = "#ffd23f";
+  for (const p of pts) { octx.beginPath(); octx.arc(p.x, p.y, 9, 0, Math.PI * 2); octx.fill(); }
+
+  // label above the highest point
+  const top = pts.reduce((a, b) => (b.y < a.y ? b : a));
+  const f = FILTERS[current], label = `${f.emoji} ${f.name}${f.ai && !aiReady ? " (loading…)" : ""}${f.ai && faceSession ? (faceOn ? " · face ✓" : " · face off") : ""}`;
+  octx.font = "600 22px ui-rounded, system-ui, sans-serif";
+  const tw = octx.measureText(label).width + 24;
+  const lx = clamp(top.x - tw / 2, 4, W - tw - 4), ly = Math.max(4, top.y - 48);
+  octx.fillStyle = "rgba(20,20,28,.75)"; octx.beginPath(); octx.roundRect(lx, ly, tw, 32, 16); octx.fill();
+  octx.fillStyle = "#fff"; octx.fillText(label, lx + 12, ly + 23);
+  octx.restore();
+}
+const faceLayer = document.createElement("canvas"), flctx = faceLayer.getContext("2d");
+
+// Average color cast of the room, used to tint the drawn face so it sits in the same lighting.
+const tintProbe = document.createElement("canvas"), tpctx = tintProbe.getContext("2d", { willReadFrequently: true });
+tintProbe.width = tintProbe.height = 4;
+let roomTint = [1, 1, 1];
+function sceneTint() {
+  tpctx.drawImage(frame, 0, 0, 4, 4);
+  const d = tpctx.getImageData(0, 0, 4, 4).data, avg = [0, 0, 0];
+  for (let i = 0; i < d.length; i += 4) for (let c = 0; c < 3; c++) avg[c] += d[i + c] / 16;
+  const m = (avg[0] + avg[1] + avg[2]) / 3 || 1;
+  const target = avg.map(v => clamp(1 + (v / m - 1) * 0.5, 0.85, 1.15) * clamp(0.75 + m / 400, 0.8, 1.05));
+  roomTint = roomTint.map((v, i) => v + (target[i] - v) * 0.05);
+  return roomTint;
+}
+const scratch = document.createElement("canvas"), sctx = scratch.getContext("2d");
+</script>
+</body>
+</html>

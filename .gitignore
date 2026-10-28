@@ -1,0 +1,19 @@
+# Local machine settings (server address, domain)
+deploy.env
+.claude/
+
+# Python environment, caches
+teacher/.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Training data and generated pairs: photos of real people (HaGRID) — not redistributed here
+teacher/data/
+# Training checkpoints, previews and sample/test images (include personal webcam frames)
+teacher/checkpoints/
+teacher/samples/
+teacher/logs*.txt
+
+# Older model versions — only the current live models are published
+models/*_v[0-9]*.onnx
