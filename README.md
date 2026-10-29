@@ -5,6 +5,12 @@ finger** (one hand makes a triangle, two hands make a frame, flip a hand to cros
 the shape is redrawn live — including **🌸 Anime**, a small neural network that turns you and your room into an
 anime drawing at ~30+ fps.
 
+![Six people framing with their fingers, each with a different effect inside the frame](docs/demo_hands.jpg)
+
+<sub>Captured from the app itself, fed still photos instead of a webcam: the hand tracker finds the fingertips and
+the effect (Old Film, Avatar, Thermal, Neon, Comic, X-Ray) is drawn only inside the shape. A flipped hand crosses the
+lines (Neon); a two-hand "director's frame" makes a six-sided frame. Photos from Unsplash (see credits).</sub>
+
 Nothing is uploaded: the camera, hand/face tracking and the anime models all run locally in the browser (WebGPU).
 
 ## Run it
@@ -79,6 +85,8 @@ region).
   [ControlNet lineart](https://huggingface.co/lllyasviel/control_v11p_sd15_lineart),
   [ControlNetMediaPipeFace](https://huggingface.co/CrucibleAI/ControlNetMediaPipeFace) (OpenRAIL),
   [LCM-LoRA](https://huggingface.co/latent-consistency/lcm-lora-sdv1-5), [TAESD](https://huggingface.co/madebyollin/taesd).
+- Demo photos ([Unsplash License](https://unsplash.com/license)): Zoshua Colah, Brooke Balentine, Sonja Prein and
+  Valeriano Escobar on [Unsplash](https://unsplash.com).
 - In the browser: [MediaPipe Tasks](https://developers.google.com/mediapipe) (Apache 2.0),
   [onnxruntime-web](https://github.com/microsoft/onnxruntime) (MIT),
   [Anime4K-WebGPU](https://github.com/Anime4KWebBoost/Anime4K-WebGPU) (MIT).

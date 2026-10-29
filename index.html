@@ -977,12 +977,22 @@ let shape = [], alpha = 0;   // smoothed polygon points, connected in order
 // Build the polygon straight from fingertip to fingertip.
 // Two hands: L thumb → L index → R index → R thumb. Flip a hand upside down and
 // the lines cross, so you get two triangles touching in the middle (a bowtie).
+// Director's frame (two L's at opposite corners, one hand high and one low): that's a frame, not a flip, so the
+// shape goes around both L's — fingertips and the two webs, in order around the middle (a clean six-sided frame).
 // One hand: thumb tip → index tip → the web between thumb and index (a triangle).
 function targetShape(hands, W, H) {
   const P = (lm, k) => ({ x: (1 - lm[k].x) * W, y: lm[k].y * H });
+  const web = lm => { const p2 = P(lm, 2), p5 = P(lm, 5); return { x: (p2.x + p5.x) / 2, y: (p2.y + p5.y) / 2 }; };
   if (hands.length >= 2) {
     const [a, b] = [...hands].sort((h1, h2) => P(h1, 0).x - P(h2, 0).x);
-    return [P(a, 4), P(a, 8), P(b, 8), P(b, 4)];
+    const tips = [P(a, 4), P(a, 8), P(b, 8), P(b, 4)], ys = tips.map(p => p.y);
+    const wa = web(a), wb = web(b);
+    if (Math.abs(wa.y - wb.y) > 0.5 * (Math.max(...ys) - Math.min(...ys))) {
+      const pts = [...tips, wa, wb];
+      const c = { x: pts.reduce((s, p) => s + p.x, 0) / 6, y: pts.reduce((s, p) => s + p.y, 0) / 6 };
+      return pts.sort((p, q) => Math.atan2(p.y - c.y, p.x - c.x) - Math.atan2(q.y - c.y, q.x - c.x));
+    }
+    return tips;
   }
   if (hands.length === 1) {
     const lm = hands[0], p2 = P(lm, 2), p5 = P(lm, 5);
